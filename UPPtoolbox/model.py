@@ -140,6 +140,7 @@ class UPP_abstract(ABC):
         # Identify which parameters to optimize
         free_indices = [i for i, name in enumerate(self._param_names) if name not in fixed_params]
         free_names = [self._param_names[i] for i in free_indices]
+        print(f'Fit model with free parameters {free_names}.') if feedback else None
     
         def to_minimize(p_free):
             full_params = init_params.copy() # the values of the fixed parameters must be in init_params
@@ -209,7 +210,7 @@ class Linear(UPP_abstract):
         
         A = 1 - self.dt / self.tau                          # discrete version of np.exp(- self.dt / self.tau)
         B = self.input_weight
-        Q = self.process_noise**2 / self.dt                 # discrete version of (self.tau*self.process_noise**2 / 2) * (1 - np.exp(-2 * self.dt / self.tau))
+        Q = self.process_noise**2 * self.dt                 # discrete version of (self.tau*self.process_noise**2 / 2) * (1 - np.exp(-2 * self.dt / self.tau))
         R = self.measure_noise**2
         
         total_log_likelihood = 0.0
@@ -231,6 +232,41 @@ class Linear(UPP_abstract):
                 P_pred = (1 - K) * P_pred                   # Update uncertainty on state P
                 total_log_likelihood += -0.5 * (np.log(2 * np.pi * S) + (innovation**2) / S)
         return total_log_likelihood
+
+    # to compute inferred hidden state from model parameters
+    def filter(self, state_series: dict[int, np.ndarray], input_series: dict[int, np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        # not categorical
+        state_series = state_series[list(state_series.keys())[0]]
+        input_series = input_series[list(input_series.keys())[0]]
+        
+        A = 1 - self.dt / self.tau                          # discrete version of np.exp(- self.dt / self.tau)
+        B = self.input_weight
+        Q = self.process_noise**2 * self.dt                 # discrete version of (self.tau*self.process_noise**2 / 2) * (1 - np.exp(-2 * self.dt / self.tau))
+        R = self.measure_noise**2
+        
+        filtered_series, measurement_noise, process_noise = np.zeros_like(state_series), np.zeros_like(state_series), np.zeros_like(state_series)
+        for trial_id in range(state_series.shape[0]):
+            states = state_series[trial_id]
+            inputs = input_series[trial_id]
+            
+            x_pred = states[0]
+            filtered_series[trial_id][0] = x_pred
+            P_pred = 1.0                                    # initial variance estimate
+            
+            for t in range(1, len(states)):
+                input_value = inputs[t-1]
+                x_pred = A * x_pred + (B*self.dt) * input_value       # Predict state x
+                P_pred = A**2 * P_pred + Q                  # Predict uncertainty on state P
+                S = P_pred + R                              # Update residual variance S
+                K = P_pred / S                              # Optimal Kalman gain
+                innovation = states[t] - x_pred             # Residual
+                x_pred = x_pred + K * innovation            # Update state x
+                P_pred = (1 - K) * P_pred                   # Update uncertainty on state P
+                filtered_series[trial_id][t] = x_pred
+                measurement_noise[trial_id][t] = states[t] - x_pred
+                process_noise[trial_id][t] = K * innovation
+        return filtered_series, measurement_noise, process_noise
+    
 
 
 
@@ -269,12 +305,12 @@ class StratifiedLinear(UPP_abstract):
         dt, tau = self.dt, self.tau
         R = self.measure_noise**2
         process_noise = self.process_noise
-        Q = self.process_noise**2 / self.dt                 # discrete version of (self.tau*self.process_noise**2 / 2) * (1 - np.exp(-2 * self.dt / self.tau))
+        Q = self.process_noise**2 * self.dt                 # discrete version of (self.tau*self.process_noise**2 / 2) * (1 - np.exp(-2 * self.dt / self.tau))
         eps = 0 # used to be 1e-12
 
         # ---- Sigma points ----
         SigmaPoints = MerweScaledSigmaPoints
-        sig_alpha, sig_beta, sig_kappa = 0.1, 2.0, 1.0
+        sig_alpha, sig_beta, sig_kappa = 1.0, 2.0, 2.0 # 1.0, 0.0, 2.0 # 1.0, 0.0, 2.0 # used to be sig_alpha, sig_beta, sig_kappa = 0.1, 2.0, 1.0 -> testing if it corrects UKF 28/01/26
         UKF_class = UKF
         core_func = self.core
 
@@ -285,7 +321,7 @@ class StratifiedLinear(UPP_abstract):
                 sigmas = SigmaPoints(n=1, alpha=sig_alpha, beta=sig_beta, kappa=sig_kappa)
                 ukf = UKF_class(
                     dim_x=1, dim_z=1,
-                    fx=lambda x, dt_local, inp=inputs[0]: core_func(x, inp, signal_category)[0],
+                    fx=lambda x, dt_local, inp=inputs[0]: core_func(x, inp, signal_category),    #[0],
                     hx=lambda x: x,
                     dt=dt, points=sigmas
                 )
@@ -296,13 +332,11 @@ class StratifiedLinear(UPP_abstract):
 
                 # ---- iterate through time ----
                 for t in range(1, len(states)):
-                    ukf.fx = lambda x, dt_local, inp=inputs[t - 1]: core_func(x, inp, signal_category)[0]
-                    ukf.predict()
+                    ukf.fx = lambda x, dt_local, inp=inputs[t - 1]: core_func(x, inp, signal_category)   #[0]
+                    ukf.predict(dt=dt, inp=inputs[t-1])
+                    ukf.P += ukf.Q # filterpy doesn't do it on its own
                     ukf.update(states[t])
-
-                    r = ukf.y[0]
-                    S = ukf.S[0, 0]
-                    total_ll += -0.5 * (np.log(2 * np.pi * S + eps) + (r ** 2) / (S + eps))
+                    total_ll += ukf.log_likelihood
 
             return total_ll
 
@@ -330,7 +364,7 @@ class StratifiedLinear(UPP_abstract):
     def loglikelihood_kalman(self, state_series: dict[int, np.ndarray], input_series: dict[int, np.ndarray]) -> float:
         
         A = 1 - self.dt / self.tau                          # discrete version of np.exp(- self.dt / self.tau)
-        Q = self.process_noise**2 / self.dt                 # discrete version of (self.tau*self.process_noise**2 / 2) * (1 - np.exp(-2 * self.dt / self.tau))
+        Q = self.process_noise**2 * self.dt                 # discrete version of (self.tau*self.process_noise**2 / 2) * (1 - np.exp(-2 * self.dt / self.tau))
         R = self.measure_noise**2
         
         total_log_likelihood = 0.0
@@ -348,7 +382,7 @@ class StratifiedLinear(UPP_abstract):
                 
                 for t in range(1, len(states)):
                     input_value = inputs[t-1]
-                    x_pred = A * x_pred + B * input_value       # Predict state x
+                    x_pred = A * x_pred + (B*self.dt) * input_value       # Predict state x
                     P_pred = A**2 * P_pred + Q                  # Predict uncertainty on state P
                     S = P_pred + R                              # Update residual variance S
                     K = P_pred / S                              # Optimal Kalman gain
@@ -357,6 +391,132 @@ class StratifiedLinear(UPP_abstract):
                     P_pred = (1 - K) * P_pred                   # Update uncertainty on state P
                     total_log_likelihood += -0.5 * (np.log(2 * np.pi * S) + (innovation**2) / S)
         return total_log_likelihood
+
+
+    # method for debugging purpose
+    def debug_ukf_step_by_step(self, states, inputs, signal_category):
+        print(f"\n--- DEBUG START (Category {signal_category}) ---")
+        
+        dt = self.dt
+        # Calculate theoretical Q and R
+        Q_val = float(self.process_noise**2 * self.dt)
+        R_val = float(self.measure_noise**2)
+        print(f"Theoretical Q: {Q_val:.5f}, R: {R_val:.5f}")
+
+        # 1. Setup UKF with 1D functions (FIX IS HERE)
+        sigmas = MerweScaledSigmaPoints(n=1, alpha=1.0, beta=0.0, kappa=2.0)
+        
+        ukf = UKF(
+            dim_x=1, dim_z=1,
+            # CHANGE: Return 1D arrays (atleast_1d) to avoid the "too many values" crash
+            fx=lambda x, dt_l, inp: np.atleast_1d(self.core(x, inp, signal_category)), 
+            hx=lambda x: np.atleast_1d(x), 
+            dt=dt, points=sigmas
+        )
+
+        # 2. Force Matrix Structure for P, Q, R, x
+        # We wrap them in 2D so the matrix addition (P += Q) works
+        ukf.x = np.atleast_2d(states[0]) 
+        ukf.P = np.atleast_2d(1.0)
+        ukf.Q = np.atleast_2d(Q_val) 
+        ukf.R = np.atleast_2d(R_val)
+        
+        print(f"Initial P: {ukf.P[0,0]}")
+
+        # 3. Run One Step
+        # Ensure inputs are extracted correctly (handle if they are lists or scalars)
+        inp_val = inputs[0] if len(inputs) > 0 else 0.0
+        obs_val = states[1] if len(states) > 1 else 0.0
+        
+        print(f"\n--- TIME STEP 1 ---")
+        
+        # PREDICT
+        ukf.predict(dt=dt, inp=inp_val)
+        print(f"P after predict (Library only): {ukf.P[0,0]:.5f}")
+        
+        # MANUAL INJECTION (The fix for the original bug)
+        ukf.P += ukf.Q
+        print(f"P after manual injection:     {ukf.P[0,0]:.5f}")
+        
+        # UPDATE
+        # Pass observation as 1D array
+        ukf.update(np.atleast_1d(obs_val))
+        
+        print(f"S (System Uncertainty):       {ukf.S[0,0]:.5f}")
+        print(f"LogLikelihood:                {ukf.log_likelihood:.5f}")
+        
+        return ukf.log_likelihood
+
+
+
+    # methods for trying using velocity as a hidden state
+    def core_augmented(self, state, input_value, signal_category):
+        """
+        state: shape (2,) or (n_trials, 2)
+        """
+        x, v = state[..., 0], state[..., 1]
+    
+        # position update
+        x_next = x + v * self.dt
+    
+        # velocity update (OU-like)
+        A_v = 1 - self.dt / self.tau
+        B_v = getattr(self, 'w' + str(signal_category))
+        v_next = A_v * v + B_v * input_value * self.dt
+    
+        return np.stack([x_next, v_next], axis=-1)
+
+    def hx_augmented(state):
+        # observe position only
+        return np.array([state[0]])
+
+    def loglikelihood_ukf_augmented(self, state_series, input_series):
+
+        dt = self.dt
+        R = np.array([[self.measure_noise**2]])
+    
+        # Process noise: only velocity is noisy
+        qv = self.process_noise**2 * dt
+        Q = np.diag([0.0, qv])
+    
+        total_ll = 0.0
+    
+        for signal_category in state_series.keys():
+            states_cat = state_series[signal_category]
+            inputs_cat = input_series[signal_category]
+    
+            for trial_states, trial_inputs in zip(states_cat, inputs_cat):
+    
+                sigmas = MerweScaledSigmaPoints(
+                    n=2, alpha=1.0, beta=2.0, kappa=0.0
+                )
+    
+                ukf = UKF(
+                    dim_x=2,
+                    dim_z=1,
+                    fx=lambda x, dt_local, inp=trial_inputs[0]:
+                        self.core_augmented(x, inp, signal_category),
+                    hx=lambda x: np.array([x[0]]),
+                    dt=dt,
+                    points=sigmas
+                )
+    
+                ukf.x = np.array([trial_states[0], 0.0])  # init v = 0
+                ukf.P = np.eye(2)
+                ukf.Q = Q
+                ukf.R = R
+    
+                for t in range(1, len(trial_states)):
+                    ukf.fx = lambda x, dt_local, inp=trial_inputs[t-1]: \
+                        self.core_augmented(x, inp, signal_category)
+    
+                    ukf.predict()
+                    ukf.update(trial_states[t])
+                    total_ll += ukf.log_likelihood
+    
+        return float(total_ll)
+
+    
 
 
 
@@ -395,12 +555,12 @@ class StratifiedLinear_kalman(UPP_abstract):
         dt, tau = self.dt, self.tau
         R = self.measure_noise**2
         process_noise = self.process_noise
-        Q = self.process_noise**2 / self.dt                 # discrete version of (self.tau*self.process_noise**2 / 2) * (1 - np.exp(-2 * self.dt / self.tau))
+        Q = self.process_noise**2 * self.dt                 # discrete version of (self.tau*self.process_noise**2 / 2) * (1 - np.exp(-2 * self.dt / self.tau))
         eps = 0 # used to be 1e-12
 
         # ---- Sigma points ----
         SigmaPoints = MerweScaledSigmaPoints
-        sig_alpha, sig_beta, sig_kappa = 0.1, 2.0, 1.0
+        sig_alpha, sig_beta, sig_kappa = 1.0, 2.0, 2.0 # 1.0, 0.0, 2.0 # used to be sig_alpha, sig_beta, sig_kappa = 0.1, 2.0, 1.0 -> testing if it corrects UKF 28/01/26
         UKF_class = UKF
         core_func = self.core
 
@@ -423,12 +583,9 @@ class StratifiedLinear_kalman(UPP_abstract):
                 # ---- iterate through time ----
                 for t in range(1, len(states)):
                     ukf.fx = lambda x, dt_local, inp=inputs[t - 1]: core_func(x, inp, signal_category)[0]
-                    ukf.predict()
+                    ukf.predict(dt=dt, inp=inputs[t-1])
                     ukf.update(states[t])
-
-                    r = ukf.y[0]
-                    S = ukf.S[0, 0]
-                    total_ll += -0.5 * (np.log(2 * np.pi * S + eps) + (r ** 2) / (S + eps))
+                    total_ll += ukf.log_likelihood
 
             return total_ll
 
@@ -456,7 +613,7 @@ class StratifiedLinear_kalman(UPP_abstract):
     def loglikelihood(self, state_series: dict[int, np.ndarray], input_series: dict[int, np.ndarray]) -> float:
         
         A = 1 - self.dt / self.tau                          # discrete version of np.exp(- self.dt / self.tau)
-        Q = self.process_noise**2 / self.dt                 # discrete version of (self.tau*self.process_noise**2 / 2) * (1 - np.exp(-2 * self.dt / self.tau))
+        Q = self.process_noise**2 * self.dt                # discrete version of (self.tau*self.process_noise**2 / 2) * (1 - np.exp(-2 * self.dt / self.tau))
         R = self.measure_noise**2
         
         total_log_likelihood = 0.0
@@ -474,7 +631,7 @@ class StratifiedLinear_kalman(UPP_abstract):
                 
                 for t in range(1, len(states)):
                     input_value = inputs[t-1]
-                    x_pred = A * x_pred + B * input_value       # Predict state x
+                    x_pred = A * x_pred + (B*self.dt) * input_value       # Predict state x
                     P_pred = A**2 * P_pred + Q                  # Predict uncertainty on state P
                     S = P_pred + R                              # Update residual variance S
                     K = P_pred / S                              # Optimal Kalman gain
@@ -484,6 +641,62 @@ class StratifiedLinear_kalman(UPP_abstract):
                     total_log_likelihood += -0.5 * (np.log(2 * np.pi * S) + (innovation**2) / S)
         return total_log_likelihood
 
+
+
+
+# for debugging purpose
+class StratifiedLinearAudit(StratifiedLinear):
+    def perform_audit(self, state_series, input_series):
+        """Runs a side-by-side comparison of KF and UKF for one trial."""
+        # Grab the first trial available
+        cat = list(input_series.keys())[0]
+        states = state_series[cat][0]
+        inputs = input_series[cat][0]
+        
+        # Setup Parameters
+        dt = self.dt
+        A = 1 - dt / self.tau
+        Q = self.process_noise**2 * dt
+        R = self.measure_noise**2
+        B = getattr(self, 'w' + str(cat))
+        
+        # Setup UKF
+        sig_alpha, sig_beta, sig_kappa = 1.0, 2.0, 2.0 # 1.0, 0.0, 2.0
+        sigmas = MerweScaledSigmaPoints(n=1, alpha=sig_alpha, beta=sig_beta, kappa=sig_kappa)
+        ukf = UKF(dim_x=1, dim_z=1, fx=self.core, hx=lambda x: x, dt=dt, points=sigmas)
+        
+        # Initialize both
+        x_kf = states[0]
+        P_kf = 1.0
+        ukf.x = np.array([states[0]])
+        ukf.P = np.eye(1)
+        ukf.Q = np.eye(1) * Q
+        ukf.R = np.eye(1) * R
+
+        print(f"{'Step':<5} | {'Source':<5} | {'x_post':<10} | {'P_post':<10} | {'Innovation (y)':<15} | {'S':<10} | {'LL_step':<10}")
+        print("-" * 85)
+
+        for t in range(1, 4): # Check first 3 steps
+            # --- KF Step ---
+            x_pred_kf = A * x_kf + B * inputs[t-1]
+            P_pred_kf = A**2 * P_kf + Q
+            S_kf = P_pred_kf + R
+            y_kf = states[t] - x_pred_kf
+            K_kf = P_pred_kf / S_kf
+            x_kf = x_pred_kf + K_kf * y_kf
+            P_kf = (1 - K_kf) * P_pred_kf
+            ll_kf = -0.5 * (np.log(2 * np.pi * S_kf) + (y_kf**2) / S_kf)
+
+            # --- UKF Step ---
+            # Explicitly redefine fx to capture the correct input
+            ukf.fx = lambda x, dt_l, inp=inputs[t-1], cat=cat: self.core(x, inp, cat)[0]
+            ukf.predict(dt=dt)
+            ukf.P += ukf.Q
+            ukf.update(states[t]) 
+            
+            print(f"{t:<5} | {'KF':<5} | {x_kf:<10.4f} | {P_kf:<10.4f} | {y_kf:<15.4f} | {S_kf:<10.4f} | {ll_kf:<10.4f}")
+            print(f"{t:<5} | {'UKF':<5} | {ukf.x[0]:<10.4f} | {ukf.P[0,0]:<10.4f} | {ukf.y[0]:<15.4f} | {ukf.S[0,0]:<10.4f} | {ukf.log_likelihood:<10.4f}")
+            print("-" * 85)
 
 
 #####################################################################################################################
@@ -530,7 +743,7 @@ class NonLinear1(UPP_abstract):
 
         # ---- Model parameters ----
         dt, tau = self.dt, self.tau
-        Q = self.process_noise**2 / dt
+        Q = self.process_noise**2 * self.dt
         R = self.measure_noise**2
         eps = 0 # used to be 1e-12
 
@@ -539,7 +752,7 @@ class NonLinear1(UPP_abstract):
         UKF_class = UKF
         core_func = self.core
 
-        sig_alpha, sig_beta, sig_kappa = 0.1, 2.0, 1.0
+        sig_alpha, sig_beta, sig_kappa = 1.0, 0.0, 2.0 # used to be sig_alpha, sig_beta, sig_kappa = 0.1, 2.0, 1.0 -> testing if it corrects UKF 28/01/26
 
         # ---- Worker for one batch ----
         def process_batch(batch_states, batch_inputs):
@@ -564,10 +777,8 @@ class NonLinear1(UPP_abstract):
                 for t in range(1, len(states)):
                     self.t = t
                     ukf.predict()
+                    logL += ukf.log_likelihood
                     ukf.update(states[t])
-                    r = ukf.y[0]
-                    S = ukf.S[0, 0]
-                    logL += -0.5 * (np.log(2 * np.pi * S + eps) + (r**2) / (S + eps))
 
                 batch_ll += logL
             return batch_ll
@@ -630,12 +841,12 @@ class StratifiedNonLinear1(UPP_abstract):
         dt, tau = self.dt, self.tau
         R = self.measure_noise**2
         process_noise = self.process_noise
-        Q = self.process_noise**2 / self.dt                 # discrete version of (self.tau*self.process_noise**2 / 2) * (1 - np.exp(-2 * self.dt / self.tau))
+        Q = self.process_noise**2 * self.dt                 # discrete version of (self.tau*self.process_noise**2 / 2) * (1 - np.exp(-2 * self.dt / self.tau))
         eps = 0 # used to be 1e-12
 
         # ---- Sigma points ----
         SigmaPoints = MerweScaledSigmaPoints
-        sig_alpha, sig_beta, sig_kappa = 0.1, 2.0, 1.0
+        sig_alpha, sig_beta, sig_kappa = 1.0, 0.0, 2.0 # used to be sig_alpha, sig_beta, sig_kappa = 0.1, 2.0, 1.0 -> testing if it corrects UKF 28/01/26
         UKF_class = UKF
         core_func = self.core
 
@@ -659,11 +870,8 @@ class StratifiedNonLinear1(UPP_abstract):
                 for t in range(1, len(states)):
                     ukf.fx = lambda x, dt_local, inp=inputs[t - 1]: core_func(x, inp, signal_category)[0]
                     ukf.predict()
+                    total_ll += ukf.log_likelihood
                     ukf.update(states[t])
-
-                    r = ukf.y[0]
-                    S = ukf.S[0, 0]
-                    total_ll += -0.5 * (np.log(2 * np.pi * S + eps) + (r ** 2) / (S + eps))
 
             return total_ll
 
@@ -687,6 +895,198 @@ class StratifiedNonLinear1(UPP_abstract):
         return float(np.sum(results))
 
 
+############################### NonLinear2
+
+
+class NonLinear2(UPP_abstract):
+    """ dx/dt = -x + input_weight * input + (ax + b) * sigmoid(threshold, sharpness, x)
+        Parallelized UKF (single-component) log-likelihood computation.
+    """
+
+    _param_names = UPP_abstract._param_names + ['input_weight', 'a', 'b', 'threshold']
+
+    def __init__(self, tau: float, process_noise: float, measure_noise: float,
+                 input_weight: float, a: float, b: float, threshold: float, sharpness: float):
+        self.input_weight = input_weight
+        self.a = a
+        self.b = b
+        self.threshold = threshold
+        self.sharpness = sharpness
+        super().__init__(tau, process_noise, measure_noise)
+
+    # ------------------------- MODEL STRUCTURE -------------------------
+
+    def input_function(self, input_value: np.ndarray, signal_category: int) -> np.ndarray:
+        return self.input_weight * input_value
+
+    def nonlinearity(self, state: np.ndarray, input_value: np.ndarray, signal_category: int) -> np.ndarray:
+        return (self.a*state + self.b) / (1 + np.exp(self.sharpness * (self.threshold - state)))
+
+    # ------------------------- FITTING TOOLS -------------------------
+
+    def loglikelihood(self, state_series: dict[int, np.ndarray], input_series: dict[int, np.ndarray]) -> float:
+        
+        n_jobs = 8
+        batch_size = 20
+        
+        # ---- Extract arrays (assume single condition) ----
+        state_arr = state_series[list(state_series.keys())[0]]
+        input_arr = input_series[list(input_series.keys())[0]]
+
+        # ---- Model parameters ----
+        dt, tau = self.dt, self.tau
+        Q = self.process_noise**2 * self.dt
+        R = self.measure_noise**2
+        eps = 0 # used to be 1e-12
+
+        # ---- Local references ----
+        SigmaPoints = MerweScaledSigmaPoints
+        UKF_class = UKF
+        core_func = self.core
+
+        sig_alpha, sig_beta, sig_kappa = 1.0, 0.0, 2.0 # used to be sig_alpha, sig_beta, sig_kappa = 0.1, 2.0, 1.0 -> testing if it corrects UKF 28/01/26
+
+        # ---- Worker for one batch ----
+        def process_batch(batch_states, batch_inputs):
+            batch_ll = 0.0
+            for states, inputs in zip(batch_states, batch_inputs):
+                sigmas = SigmaPoints(n=1, alpha=sig_alpha, beta=sig_beta, kappa=sig_kappa)
+
+                def fx(x, dt_local):
+                    input_value = inputs[self.t - 1]
+                    return core_func(x, input_value, 0)[0]
+
+                def hx(x):
+                    return x
+
+                ukf = UKF_class(dim_x=1, dim_z=1, fx=fx, hx=hx, dt=dt, points=sigmas)
+                ukf.Q = np.eye(1) * Q
+                ukf.R = np.eye(1) * R
+                ukf.x = np.array([states[0]])
+                ukf.P = np.eye(1)
+
+                logL = 0.0
+                for t in range(1, len(states)):
+                    self.t = t
+                    ukf.predict()
+                    logL += ukf.log_likelihood
+                    ukf.update(states[t])
+
+                batch_ll += logL
+            return batch_ll
+
+        # ---- Build batches ----
+        n_trials = state_arr.shape[0]
+        batches = [
+            (state_arr[i:i + batch_size], input_arr[i:i + batch_size])
+            for i in range(0, n_trials, batch_size)
+        ]
+
+        # ---- Run in parallel ----
+        results = Parallel(n_jobs=n_jobs, backend='loky')(
+            delayed(process_batch)(bs, bi) for bs, bi in batches
+        )
+
+        return float(np.sum(results))
+
+
+
+
+class StratifiedNonLinear2(UPP_abstract):
+    """ dx/dt = -x + w_category * input + gain * sigmoid(threshold, sharpness, x)
+        Parallelized Unscented Kalman Filter (UKF) likelihood with stratified categories.
+    """
+
+    _param_names = (
+        UPP_abstract._param_names
+        + ['w0', 'w1', 'w2', 'w3', 'w4', 'w5', 'w6', 'a', 'b', 'threshold']
+    )
+
+    def __init__(self, tau: float, process_noise: float, measure_noise: float, 
+                 a: float, b: float, threshold: float, sharpness: float,
+                 w0=0, w1=0, w2=0, w3=0, w4=0, w5=0, w6=0):
+        self.a = a
+        self.b = b
+        self.threshold = threshold
+        self.sharpness = sharpness
+        self.w0, self.w1, self.w2, self.w3, self.w4, self.w5, self.w6 = w0, w1, w2, w3, w4, w5, w6
+        super().__init__(tau, process_noise, measure_noise)
+
+    # ------------------------- MODEL STRUCTURE -------------------------
+
+    def input_function(self, input_value: np.ndarray, signal_category: int) -> np.ndarray:
+        w = getattr(self, f"w{signal_category}")
+        return w * input_value
+
+    def nonlinearity(self, state: np.ndarray, input_value: np.ndarray, signal_category: int) -> np.ndarray:
+        return (self.a*state + self.b) / (1 + np.exp(self.sharpness * (self.threshold - state)))
+
+    # ------------------------- FITTING TOOLS -------------------------
+
+    def loglikelihood(self, state_series: dict[int, np.ndarray], input_series: dict[int, np.ndarray]):
+        """
+        Parallelized UKF log-likelihood (no Gaussian mixture).
+        """
+        n_jobs = 8
+        batch_size = 20
+
+        # ---- Parameters ----
+        dt, tau = self.dt, self.tau
+        R = self.measure_noise**2
+        process_noise = self.process_noise
+        Q = self.process_noise**2 * self.dt                 # discrete version of (self.tau*self.process_noise**2 / 2) * (1 - np.exp(-2 * self.dt / self.tau))
+        eps = 0 # used to be 1e-12
+
+        # ---- Sigma points ----
+        SigmaPoints = MerweScaledSigmaPoints
+        sig_alpha, sig_beta, sig_kappa = 1.0, 0.0, 2.0 # used to be sig_alpha, sig_beta, sig_kappa = 0.1, 2.0, 1.0 -> testing if it corrects UKF 28/01/26
+        UKF_class = UKF
+        core_func = self.core
+
+        # ---- Worker for one batch of one category ----
+        def process_batch(batch_states, batch_inputs, signal_category):
+            total_ll = 0.0
+            for states, inputs in zip(batch_states, batch_inputs):
+                sigmas = SigmaPoints(n=1, alpha=sig_alpha, beta=sig_beta, kappa=sig_kappa)
+                ukf = UKF_class(
+                    dim_x=1, dim_z=1,
+                    fx=lambda x, dt_local, inp=inputs[0]: core_func(x, inp, signal_category)[0],
+                    hx=lambda x: x,
+                    dt=dt, points=sigmas
+                )
+                ukf.x = np.array([states[0]])
+                ukf.P = np.eye(1)
+                ukf.Q = np.eye(1) * Q
+                ukf.R = np.eye(1) * R
+
+                # ---- iterate through time ----
+                for t in range(1, len(states)):
+                    ukf.fx = lambda x, dt_local, inp=inputs[t - 1]: core_func(x, inp, signal_category)[0]
+                    ukf.predict()
+                    total_ll += ukf.log_likelihood
+                    ukf.update(states[t])
+
+            return total_ll
+
+        # ---- Build category-wise batches ----
+        tasks = []
+        for signal_category in input_series.keys():
+            states_cat = state_series[signal_category]
+            inputs_cat = input_series[signal_category]
+            n_trials = states_cat.shape[0]
+            batches = [
+                (states_cat[i:i + batch_size], inputs_cat[i:i + batch_size], signal_category)
+                for i in range(0, n_trials, batch_size)
+            ]
+            tasks.extend(batches)
+
+        # ---- Parallel execution ----
+        results = Parallel(n_jobs=n_jobs, backend='loky')(
+            delayed(process_batch)(bs, bi, cat) for bs, bi, cat in tasks
+        )
+
+        return float(np.sum(results))
+    
         
 #####################################################################################################################
 #####################################################################################################################
@@ -728,7 +1128,7 @@ class GainModulation(UPP_abstract):
 
         # ---- Model parameters ----
         dt, tau = self.dt, self.tau
-        Q = self.process_noise**2 / dt
+        Q = self.process_noise**2 * self.dt
         R = self.measure_noise**2
         eps = 0 # used to be 1e-12
 
@@ -737,7 +1137,7 @@ class GainModulation(UPP_abstract):
         UKF_class = UKF
         core_func = self.core
 
-        sig_alpha, sig_beta, sig_kappa = 0.1, 2.0, 1.0
+        sig_alpha, sig_beta, sig_kappa = 1.0, 0.0, 2.0 # used to be sig_alpha, sig_beta, sig_kappa = 0.1, 2.0, 1.0 -> testing if it corrects UKF 28/01/26
 
         # ---- Worker for one batch ----
         def process_batch(batch_states, batch_inputs):
@@ -762,10 +1162,8 @@ class GainModulation(UPP_abstract):
                 for t in range(1, len(states)):
                     self.t = t
                     ukf.predict()
+                    logL += ukf.log_likelihood
                     ukf.update(states[t])
-                    r = ukf.y[0]
-                    S = ukf.S[0, 0]
-                    logL += -0.5 * (np.log(2 * np.pi * S + eps) + (r**2) / (S + eps))
 
                 batch_ll += logL
             return batch_ll
@@ -840,12 +1238,12 @@ class StratifiedGainModulation(UPP_abstract):
         dt, tau = self.dt, self.tau
         R = self.measure_noise**2
         process_noise = self.process_noise
-        Q = self.process_noise**2 / self.dt                 # discrete version of (self.tau*self.process_noise**2 / 2) * (1 - np.exp(-2 * self.dt / self.tau))
+        Q = self.process_noise**2 * self.dt                 # discrete version of (self.tau*self.process_noise**2 / 2) * (1 - np.exp(-2 * self.dt / self.tau))
         eps = 0 # used to be 1e-12
 
         # ---- Sigma points ----
         SigmaPoints = MerweScaledSigmaPoints
-        sig_alpha, sig_beta, sig_kappa = 0.1, 2.0, 1.0
+        sig_alpha, sig_beta, sig_kappa = 1.0, 0.0, 2.0 # used to be sig_alpha, sig_beta, sig_kappa = 0.1, 2.0, 1.0 -> testing if it corrects UKF 28/01/26
         UKF_class = UKF
         core_func = self.core
 
@@ -869,11 +1267,8 @@ class StratifiedGainModulation(UPP_abstract):
                 for t in range(1, len(states)):
                     ukf.fx = lambda x, dt_local, inp=inputs[t - 1]: core_func(x, inp, signal_category)[0]
                     ukf.predict()
+                    total_ll += ukf.log_likelihood
                     ukf.update(states[t])
-
-                    r = ukf.y[0]
-                    S = ukf.S[0, 0]
-                    total_ll += -0.5 * (np.log(2 * np.pi * S + eps) + (r ** 2) / (S + eps))
 
             return total_ll
 
